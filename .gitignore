@@ -1,0 +1,28 @@
+# Python e empacotamento
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+
+# Dados locais: podem conter credenciais, e-mails, fotos ou caminhos pessoais
+config/settings.json
+config/*.json
+logs/
+fotos/
+
+# Segredos e artefatos locais
+.env
+.env.*
+!.env.example
+*senha*
+*password*
+*secret*
+*credential*
+assets/icones/google_app_passwords_qr.png
+
+# Temporários do Windows/editor
+Thumbs.db
+Desktop.ini
+.vscode/
