@@ -30,9 +30,19 @@ O **Camera Museu DEN** é um aplicativo desktop para fotografias do museu. Ele o
 
 Baixe `CameraMuseuDEN.exe` em [Releases](../../releases/latest). No Windows, abra o executável para iniciar o aplicativo. O Windows pode exibir um aviso para aplicativos sem assinatura digital; nesse caso, confirme que baixou o arquivo da página de Releases deste repositório.
 
+Consulte também o [Manual do Usuário em PDF](docs/Manual_de_Usuario.pdf), com instruções ilustradas para usar o aplicativo.
+
 ## Manual
 
 O [Manual do Usuário](docs/Manual_de_Usuario.pdf) explica, com capturas de tela, como tirar fotos, escolher molduras, configurar o e-mail e resolver problemas comuns.
+
+## Iniciar o app junto com o Windows
+
+1. No Explorador de Arquivos, encontre `CameraMuseuDEN.exe` e crie um atalho para ele (clique com o botão direito e escolha **Criar atalho**; no Windows 11, essa opção pode estar em **Mostrar mais opções**).
+2. Pressione **Win + R**, digite `shell:startup` e pressione **Enter** para abrir a pasta de inicialização da sua conta do Windows.
+3. Copie o atalho do app para essa pasta.
+
+O app será aberto automaticamente quando essa conta entrar no Windows. Para desativar a inicialização automática, remova o atalho dessa pasta.
 
 ## Executar pelo código-fonte
 
