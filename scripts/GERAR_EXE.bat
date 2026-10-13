@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 python -m PyInstaller --noconfirm --clean CameraMuseuDEN.spec
 
@@ -12,5 +12,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo Executavel criado em: %~dp0dist\CameraMuseuDEN.exe
+echo Executavel criado em: %CD%\dist\CameraMuseuDEN.exe
 pause

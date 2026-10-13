@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - handled in the UI
 
 try:
     import cairosvg
-except ImportError:  # pragma: no cover - installed for the packaged app
+except (ImportError, OSError):  # pragma: no cover - sem cairo, usa os PNGs
     cairosvg = None
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -72,6 +72,7 @@ ASSETS_DIR = DATA_DIR / "assets"
 LOCAL_BACKGROUNDS_DIR = ASSETS_DIR / "fundos"
 PHOTO_DIR = DATA_DIR / "fotos"
 LOG_DIR = DATA_DIR / "logs"
+OUTBOX_DIR = DATA_DIR / "fila_email"
 SOUND_PATH = ASSETS_DIR / "audio" / "nudge.wav"
 ICON_PATH = ASSETS_DIR / "icones" / "camera_museu.ico"
 GOOGLE_APP_PASSWORDS_URL = "https://myaccount.google.com/apppasswords"
@@ -85,7 +86,9 @@ ADMIN_PASSWORD_ITERATIONS = 240_000
 
 def ensure_user_data() -> None:
     """Cria a pasta de dados e copia recursos empacotados apenas quando faltarem."""
-    for directory in (DATA_DIR, ASSETS_DIR, LOCAL_BACKGROUNDS_DIR, PHOTO_DIR, LOG_DIR):
+    for directory in (
+        DATA_DIR, ASSETS_DIR, LOCAL_BACKGROUNDS_DIR, PHOTO_DIR, LOG_DIR, OUTBOX_DIR
+    ):
         directory.mkdir(parents=True, exist_ok=True)
 
     if not BUNDLED_ASSETS_DIR.exists():
@@ -437,45 +440,281 @@ class EmailResult:
 
 
 class EmailService:
+    # Tempo máximo para cada etapa curta do protocolo (DNS/conexão/TLS/login).
+    CONNECT_TIMEOUT = 45
+    # Velocidade mínima de upload considerada ao calcular o tempo limite do
+    # envio do anexo (8 KB/s ≈ 64 kbit/s, uma conexão bem ruim).
+    MIN_UPLOAD_BYTES_PER_SECOND = 8 * 1024
+    # Acima deste tamanho a foto é reduzida apenas para o e-mail.
+    MAX_ATTACHMENT_BYTES = 1_500_000
+
+    @staticmethod
+    def _open(host: str, port: int, security: str):
+        context = ssl.create_default_context()
+        timeout = EmailService.CONNECT_TIMEOUT
+        if security == "SSL":
+            return smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
+        smtp = smtplib.SMTP(host, port, timeout=timeout)
+        try:
+            smtp.ehlo()
+            smtp.starttls(context=context)
+            smtp.ehlo()
+        except Exception:
+            smtp.close()
+            raise
+        return smtp
+
     @staticmethod
     def connect_and_login(settings: dict[str, Any], password: str):
         host = str(settings["smtp_host"]).strip()
         port = int(settings["smtp_port"])
         security = str(settings["smtp_security"]).upper()
-        context = ssl.create_default_context()
-        if security == "SSL":
-            smtp = smtplib.SMTP_SSL(host, port, timeout=20, context=context)
-        else:
-            smtp = smtplib.SMTP(host, port, timeout=20)
-            smtp.ehlo()
-            smtp.starttls(context=context)
-            smtp.ehlo()
-        smtp.login(str(settings["sender_email"]).strip(), password)
-        return smtp
+        attempts = [(port, security)]
+        # Algumas redes bloqueiam uma das portas do Gmail; tenta a outra
+        # automaticamente se a conexão (não a autenticação) falhar.
+        if host.lower() == "smtp.gmail.com":
+            alternative = (587, "STARTTLS") if security == "SSL" else (465, "SSL")
+            if alternative not in attempts:
+                attempts.append(alternative)
+
+        last_error: Exception | None = None
+        for attempt_port, attempt_security in attempts:
+            try:
+                smtp = EmailService._open(host, attempt_port, attempt_security)
+            except (OSError, smtplib.SMTPException) as exc:
+                LOGGER.warning(
+                    "Conexão SMTP falhou em %s:%s (%s): %s",
+                    host, attempt_port, attempt_security, exc,
+                )
+                last_error = exc
+                continue
+            try:
+                smtp.login(str(settings["sender_email"]).strip(), password)
+            except Exception:
+                smtp.close()
+                raise
+            return smtp
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _attachment_bytes(photo_path: Path) -> bytes:
+        data = photo_path.read_bytes()
+        if len(data) <= EmailService.MAX_ATTACHMENT_BYTES:
+            return data
+        # Reduz somente a cópia enviada; o arquivo salvo continua intacto.
+        with Image.open(BytesIO(data)) as source:
+            image = source.convert("RGB")
+            image.thumbnail((1920, 1920), Image.LANCZOS)
+            buffer = BytesIO()
+            image.save(buffer, "JPEG", quality=85, optimize=True)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _send_message(smtp, msg: EmailMessage) -> None:
+        # No Python 3.5+ o timeout do socket limita a duração TOTAL do sendall,
+        # então um anexo em upload lento estouraria o tempo. Ajusta o limite
+        # ao tamanho real da mensagem antes de transmitir.
+        size = len(msg.as_bytes())
+        if smtp.sock is not None:
+            smtp.sock.settimeout(
+                max(120, size / EmailService.MIN_UPLOAD_BYTES_PER_SECOND)
+            )
+        smtp.send_message(msg)
+
+    @staticmethod
+    def _base_message(settings: dict[str, Any], recipient: str, subject: str) -> EmailMessage:
+        msg = EmailMessage()
+        sender_name = str(settings.get("sender_name", "Museu")).strip()
+        sender_email = str(settings["sender_email"]).strip()
+        msg["Subject"] = subject
+        msg["From"] = f"{sender_name} <{sender_email}>"
+        msg["To"] = recipient
+        return msg
 
     @staticmethod
     def send(
         settings: dict[str, Any], password: str, recipient: str, photo_path: Path
     ) -> None:
-        msg = EmailMessage()
-        sender_name = str(settings.get("sender_name", "Museu")).strip()
-        sender_email = str(settings["sender_email"]).strip()
-        msg["Subject"] = "Sua foto no Museu de Ciências Nucleares"
-        msg["From"] = f"{sender_name} <{sender_email}>"
-        msg["To"] = recipient
+        msg = EmailService._base_message(
+            settings, recipient, "Sua foto no Museu de Ciências Nucleares"
+        )
         msg.set_content(
             "Olá!\n\nSua foto está anexada. Obrigado pela visita!\n\n"
             "Museu de Ciências Nucleares"
         )
-        data = photo_path.read_bytes()
         msg.add_attachment(
-            data,
+            EmailService._attachment_bytes(photo_path),
             maintype="image",
             subtype="jpeg",
             filename=photo_path.name,
         )
         with EmailService.connect_and_login(settings, password) as smtp:
-            smtp.send_message(msg)
+            EmailService._send_message(smtp, msg)
+
+    @staticmethod
+    def send_test(settings: dict[str, Any], password: str) -> str:
+        """Faz login e envia um e-mail de teste para o próprio remetente."""
+        sender_email = str(settings["sender_email"]).strip()
+        msg = EmailService._base_message(
+            settings, sender_email, f"Teste SMTP - {APP_NAME}"
+        )
+        msg.set_content(
+            f"Este é um e-mail de teste enviado pelo {APP_NAME} em "
+            f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}.\n\n"
+            "Se você recebeu esta mensagem, o envio das fotos está funcionando."
+        )
+        with EmailService.connect_and_login(settings, password) as smtp:
+            EmailService._send_message(smtp, msg)
+        return sender_email
+
+
+class EmailOutbox:
+    """Fila persistente de envios com novas tentativas automáticas.
+
+    Cada envio vira um arquivo JSON em OUTBOX_DIR. Uma thread em segundo plano
+    tenta enviar os itens pendentes, esperando cada vez mais entre as falhas,
+    e retoma a fila quando o app é aberto novamente. Assim, uma internet lenta
+    ou instável nunca trava o quiosque nem perde a foto do visitante.
+    """
+
+    RETRY_DELAYS = (10, 20, 40, 60, 120, 300)
+    AUTH_RETRY_DELAY = 600
+
+    def __init__(
+        self,
+        folder: Path,
+        get_credentials: Callable[[], tuple[dict[str, Any], str]],
+        notify: Callable[[EmailResult], None],
+    ) -> None:
+        self.folder = folder
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.get_credentials = get_credentials
+        self.notify = notify
+        self.lock = threading.Lock()
+        self.wake_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake_event.set()
+
+    def wake(self) -> None:
+        """Reenvia imediatamente tudo que estiver pendente."""
+        with self.lock:
+            for path, job in self._jobs():
+                job["next_attempt"] = 0
+                self._write(path, job)
+        self.wake_event.set()
+
+    def enqueue(self, recipient: str, photo_path: Path) -> None:
+        job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        job = {
+            "recipient": recipient,
+            "photo_path": str(photo_path),
+            "attempts": 0,
+            "created": time.time(),
+            "next_attempt": 0,
+        }
+        with self.lock:
+            self._write(self.folder / f"{job_id}.json", job)
+        self.wake_event.set()
+
+    def pending_count(self) -> int:
+        with self.lock:
+            return len(self._jobs())
+
+    def _write(self, path: Path, job: dict[str, Any]) -> None:
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(path)
+
+    def _jobs(self) -> list[tuple[Path, dict[str, Any]]]:
+        jobs = []
+        for path in sorted(self.folder.glob("*.json")):
+            try:
+                jobs.append((path, json.loads(path.read_text(encoding="utf-8"))))
+            except Exception as exc:
+                LOGGER.warning("Item inválido na fila de e-mail %s: %s", path.name, exc)
+        return jobs
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            wait = self._process_due()
+            self.wake_event.wait(timeout=wait)
+            self.wake_event.clear()
+
+    def _process_due(self) -> float:
+        """Envia os itens vencidos e devolve quantos segundos esperar."""
+        with self.lock:
+            jobs = self._jobs()
+        next_wait = 60.0
+        for path, job in jobs:
+            if self.stop_event.is_set():
+                break
+            remaining = float(job.get("next_attempt", 0)) - time.time()
+            if remaining > 0:
+                next_wait = min(next_wait, remaining)
+                continue
+
+            recipient = str(job.get("recipient", ""))
+            photo_path = Path(str(job.get("photo_path", "")))
+            if not photo_path.exists():
+                LOGGER.warning("Foto da fila não encontrada; descartando: %s", photo_path)
+                with self.lock:
+                    path.unlink(missing_ok=True)
+                continue
+
+            settings, password = self.get_credentials()
+            attempts = int(job.get("attempts", 0)) + 1
+            try:
+                if not str(settings.get("sender_email", "")).strip() or not password:
+                    raise smtplib.SMTPAuthenticationError(
+                        0, b"Remetente ou senha de aplicativo nao configurados."
+                    )
+                EmailService.send(settings, password, recipient, photo_path)
+            except Exception as exc:
+                is_auth = isinstance(exc, smtplib.SMTPAuthenticationError)
+                delay = (
+                    self.AUTH_RETRY_DELAY
+                    if is_auth
+                    else self.RETRY_DELAYS[min(attempts - 1, len(self.RETRY_DELAYS) - 1)]
+                )
+                LOGGER.warning(
+                    "Falha no envio SMTP (tentativa %s, nova em %ss): %s",
+                    attempts, delay, exc,
+                )
+                job["attempts"] = attempts
+                job["next_attempt"] = time.time() + delay
+                with self.lock:
+                    if path.exists():
+                        self._write(path, job)
+                next_wait = min(next_wait, delay)
+                # Avisa só na primeira falha para não poluir a tela a cada tentativa.
+                if attempts == 1:
+                    self.notify(EmailResult(False, self._retry_message(exc), recipient))
+                continue
+
+            with self.lock:
+                path.unlink(missing_ok=True)
+            LOGGER.info(
+                "E-mail enviado para %s após %s tentativa(s)", mask_email(recipient), attempts
+            )
+            self.notify(EmailResult(True, "Foto enviada com sucesso!", recipient))
+        return max(1.0, next_wait)
+
+    @staticmethod
+    def _retry_message(exc: Exception) -> str:
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            return (
+                "Foto salva, mas o e-mail não foi autenticado. "
+                "Verifique remetente e senha em Configurações; o envio ficará pendente."
+            )
+        return "Internet lenta ou instável: a foto está salva e será reenviada automaticamente."
 
 
 class CameraMuseuApp(ctk.CTk):
@@ -511,6 +750,11 @@ class CameraMuseuApp(ctk.CTk):
             int(self.settings["camera_height"]),
         )
         self.result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.outbox = EmailOutbox(
+            OUTBOX_DIR,
+            self._email_credentials,
+            lambda result: self.result_queue.put(("email", result)),
+        )
         self.last_frame = None
         self.preview_image = None
         self.preview_pil: Image.Image | None = None
@@ -547,6 +791,15 @@ class CameraMuseuApp(ctk.CTk):
         self._apply_fullscreen(bool(self.settings.get("fullscreen", False)))
         self.after(15, self.update_video)
         self.after(150, self.poll_results)
+        self.outbox.start()
+        pending = self.outbox.pending_count()
+        if pending:
+            self.set_status(f"{pending} e-mail(s) pendente(s) serão reenviados.", "#FFD37A")
+
+    def _email_credentials(self) -> tuple[dict[str, Any], str]:
+        settings = dict(self.settings)
+        sender = str(settings.get("sender_email", "")).strip()
+        return settings, self.store.get_password(sender)
 
     def _build_ui(self) -> None:
         self.grid_rowconfigure(0, weight=1)
@@ -562,80 +815,78 @@ class CameraMuseuApp(ctk.CTk):
         self.preview_label = ctk.CTkLabel(self.stage, text="", fg_color="#071116")
         self.preview_label.grid(row=0, column=0, sticky="nsew")
 
+        # Barra simétrica: todos os controles têm a mesma altura, os botões de
+        # ação a mesma largura e o espaçamento interno é igual em todos os lados.
+        bar_pad = 8
+        control_height = 44
+        action_width = 150
+        button_font = ctk.CTkFont(size=15, weight="bold")
         top = ctk.CTkFrame(
             self.stage,
             fg_color="#34383E",
             corner_radius=0,
-            height=56,
             border_width=0,
         )
         top.place(relx=0.5, y=18, anchor="n")
 
-        self.capture_button = ctk.CTkButton(
-            top,
-            text="Tirar Foto",
-            image=self.nav_icons["camera"],
-            compound="left",
-            width=132,
-            height=48,
-            corner_radius=0,
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color=self.TURQUOISE,
-            hover_color=self.TURQUOISE_HOVER,
-            command=self.start_capture,
-        )
-        self.capture_button.grid(row=0, column=0, padx=(8, 6), pady=6)
+        def action_button(column: int, text: str, icon: str, command) -> ctk.CTkButton:
+            button = ctk.CTkButton(
+                top,
+                text=text,
+                image=self.nav_icons[icon],
+                compound="left",
+                width=action_width,
+                height=control_height,
+                corner_radius=0,
+                font=button_font,
+                fg_color=self.TURQUOISE,
+                hover_color=self.TURQUOISE_HOVER,
+                command=command,
+            )
+            button.grid(
+                row=0,
+                column=column,
+                padx=(bar_pad, 0),
+                pady=bar_pad,
+            )
+            return button
 
-        ctk.CTkButton(
-            top,
-            text="Moldura",
-            image=self.nav_icons["moldura"],
-            compound="left",
-            width=140,
-            height=48,
-            corner_radius=0,
-            fg_color=self.TURQUOISE,
-            hover_color=self.TURQUOISE_HOVER,
-            font=ctk.CTkFont(size=15),
-            command=self.open_gallery,
-        ).grid(row=0, column=1, padx=6, pady=6)
+        self.capture_button = action_button(0, "Tirar Foto", "camera", self.start_capture)
+        action_button(1, "Moldura", "moldura", self.open_gallery)
 
         ctk.CTkLabel(
             top,
-            text="E-mail:",
+            text=" E-mail:",
             image=self.nav_icons["email"],
             compound="left",
+            height=control_height,
             text_color=self.TEXT,
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).grid(
-            row=0, column=2, padx=(18, 10)
-        )
+            font=button_font,
+        ).grid(row=0, column=2, padx=(bar_pad * 3, bar_pad))
         self.recipient_entry = ctk.CTkEntry(
             top,
-            width=270,
-            height=32,
+            width=300,
+            height=control_height,
             placeholder_text="visitante@exemplo.com",
             corner_radius=0,
             fg_color="#3B3F45",
             border_color="#E5E8EA",
             border_width=1,
+            font=ctk.CTkFont(size=15),
         )
-        self.recipient_entry.grid(row=0, column=3, padx=(0, 10))
+        self.recipient_entry.grid(row=0, column=3, pady=bar_pad)
 
         ctk.CTkButton(
             top,
             text="",
             image=self.nav_icons["configuracoes"],
-            width=54,
-            height=48,
+            width=control_height,
+            height=control_height,
             corner_radius=0,
-            anchor="center",
-            compound="left",
-            font=ctk.CTkFont(size=21),
             fg_color=self.TURQUOISE,
             hover_color=self.TURQUOISE_HOVER,
             command=self.open_settings,
-        ).grid(row=0, column=4, padx=(4, 8), pady=6)
+        ).grid(row=0, column=4, padx=bar_pad, pady=bar_pad)
 
         self.status_badge = ctk.CTkFrame(
             self.stage,
@@ -664,40 +915,35 @@ class CameraMuseuApp(ctk.CTk):
 
     @staticmethod
     def _load_nav_icons() -> dict[str, ctk.CTkImage]:
-        icon_dir = ASSETS_DIR / "icones"
-        icon_paths = {
-            "camera": icon_dir / "camera.svg",
-            "moldura": icon_dir / "moldura.png",
-            "email": icon_dir / "email.png",
-            "configuracoes": icon_dir / "configuracoes.png",
-        }
-        sizes = {
-            "camera": (20, 20),
-            "moldura": (20, 20),
-            "email": (16, 16),
-            "configuracoes": (24, 24),
-        }
+        # Os ícones da interface vêm do pacote do app (e não da cópia em
+        # Documentos), para que atualizações do app troquem os ícones.
+        icon_dirs = [BUNDLED_ASSETS_DIR / "icones", ASSETS_DIR / "icones"]
+        size = (22, 22)
         icons: dict[str, ctk.CTkImage] = {}
-        for name, size in sizes.items():
-            path = icon_paths[name]
-            if path.suffix.lower() == ".svg":
-                if cairosvg is None:
-                    raise RuntimeError("A biblioteca cairosvg não está instalada.")
-                rendered = cairosvg.svg2png(
-                    url=str(path),
-                    output_width=size[0] * 4,
-                    output_height=size[1] * 4,
-                )
-                with Image.open(BytesIO(rendered)) as source:
-                    image = source.convert("RGBA").copy()
-            else:
-                with Image.open(path) as source:
-                    image = source.convert("RGBA").copy()
-            icons[name] = ctk.CTkImage(
-                light_image=image,
-                dark_image=image,
-                size=size,
-            )
+        for name in ("camera", "moldura", "email", "configuracoes"):
+            image = None
+            for icon_dir in icon_dirs:
+                svg_path = icon_dir / f"{name}.svg"
+                png_path = icon_dir / f"{name}.png"
+                try:
+                    if cairosvg is not None and svg_path.exists():
+                        rendered = cairosvg.svg2png(
+                            url=str(svg_path),
+                            output_width=size[0] * 4,
+                            output_height=size[1] * 4,
+                        )
+                        with Image.open(BytesIO(rendered)) as source:
+                            image = source.convert("RGBA").copy()
+                    elif png_path.exists():
+                        with Image.open(png_path) as source:
+                            image = source.convert("RGBA").copy()
+                except Exception as exc:
+                    LOGGER.warning("Falha ao carregar o ícone %s: %s", name, exc)
+                if image is not None:
+                    break
+            if image is None:
+                image = Image.new("RGBA", (size[0] * 4, size[1] * 4), (0, 0, 0, 0))
+            icons[name] = ctk.CTkImage(light_image=image, dark_image=image, size=size)
         return icons
 
     def current_background(self) -> Path | None:
@@ -912,39 +1158,32 @@ class CameraMuseuApp(ctk.CTk):
         self.set_status(message, "#FFB4A9")
 
     def _send_photo(self, recipient: str, photo_path: Path) -> None:
+        # O envio vai para a fila em segundo plano: o quiosque fica livre
+        # imediatamente para o próximo visitante, mesmo com internet lenta.
+        self.outbox.enqueue(recipient, photo_path)
+        self.recipient_entry.delete(0, "end")
+        self.app_state = "PRONTO"
+        self.capture_button.configure(state="normal", text="Tirar Foto")
         sender = str(self.settings.get("sender_email", "")).strip()
-        password = self.store.get_password(sender)
-        if not sender or not password:
-            self.app_state = "PRONTO"
-            self.capture_button.configure(state="normal", text="Tirar Foto")
+        if not sender or not self.store.get_password(sender):
             self.set_status(
-                "Foto salva. Configure o e-mail remetente e a senha para enviar.",
+                "Foto salva. Configure o e-mail remetente e a senha; o envio ficará pendente.",
                 "#FFD37A",
             )
             return
-        self.app_state = "ENVIANDO"
-        self.capture_button.configure(text="Enviando…", state="disabled")
-        self.set_status(f"Enviando para {mask_email(recipient)}…")
-        snapshot = dict(self.settings)
-
-        def worker() -> None:
-            try:
-                EmailService.send(snapshot, password, recipient, photo_path)
-                result = EmailResult(True, "Foto enviada com sucesso!", recipient)
-            except Exception as exc:
-                LOGGER.warning("Falha no envio SMTP: %s", exc)
-                result = EmailResult(False, self._friendly_email_error(exc), recipient)
-            self.result_queue.put(("email", result))
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.set_status(f"Foto salva! Enviando para {mask_email(recipient)}…")
 
     @staticmethod
     def _friendly_email_error(exc: Exception) -> str:
         if isinstance(exc, smtplib.SMTPAuthenticationError):
             return "Autenticação recusada. Verifique o e-mail e a senha de aplicativo."
         if isinstance(exc, (TimeoutError, smtplib.SMTPServerDisconnected)):
-            return "O servidor de e-mail não respondeu. A foto continua salva."
-        return f"Não foi possível enviar. A foto continua salva. ({exc})"
+            return "O servidor de e-mail não respondeu a tempo. Verifique a internet."
+        if isinstance(exc, ssl.SSLError):
+            return f"Falha na conexão segura. Confira a porta e a segurança. ({exc})"
+        if isinstance(exc, OSError):
+            return f"Sem conexão com o servidor SMTP. Verifique a internet e o servidor. ({exc})"
+        return f"Não foi possível enviar. ({exc})"
 
     def poll_results(self) -> None:
         if self.closing:
@@ -954,18 +1193,12 @@ class CameraMuseuApp(ctk.CTk):
                 event, payload = self.result_queue.get_nowait()
                 if event == "email":
                     result: EmailResult = payload
-                    self.app_state = "PRONTO"
-                    self.capture_button.configure(state="normal", text="Tirar Foto")
                     if result.ok:
                         self.set_status(
                             f"Foto enviada para {mask_email(result.recipient)}.", "#8BE6B1"
                         )
-                        self.recipient_entry.delete(0, "end")
                     else:
-                        self.set_status(result.message, "#FFB4A9")
-                elif event == "smtp_test":
-                    ok, text_value = payload
-                    self.set_status(text_value, "#8BE6B1" if ok else "#FFB4A9")
+                        self.set_status(result.message, "#FFD37A")
         except queue.Empty:
             pass
         self.after(150, self.poll_results)
@@ -1348,6 +1581,7 @@ class CameraMuseuApp(ctk.CTk):
                 self._apply_fullscreen(bool(self.settings["fullscreen"]))
                 self._update_background_name()
                 self.set_status("Configurações salvas.", "#8BE6B1")
+                self.outbox.wake()
                 settings_saved["value"] = True
                 if close:
                     window.destroy()
@@ -1355,6 +1589,11 @@ class CameraMuseuApp(ctk.CTk):
             except Exception as exc:
                 messagebox.showerror("Configurações", str(exc), parent=window)
                 return False
+
+        test_status = ctk.CTkLabel(
+            footer, text="", anchor="w", justify="left", wraplength=420
+        )
+        test_status.grid(row=0, column=0, padx=(4, 12), sticky="ew")
 
         def test_smtp() -> None:
             try:
@@ -1372,18 +1611,44 @@ class CameraMuseuApp(ctk.CTk):
             except Exception as exc:
                 messagebox.showerror("Teste SMTP", str(exc), parent=window)
                 return
-            self.set_status("Testando a conexão SMTP…")
+
+            test_button.configure(state="disabled", text="Testando…")
+            test_status.configure(
+                text="Conectando e enviando e-mail de teste… (pode demorar com internet lenta)",
+                text_color="#D7E4E8",
+            )
+            results: queue.Queue[tuple[bool, str]] = queue.Queue()
+            started = time.monotonic()
 
             def worker() -> None:
                 try:
-                    with EmailService.connect_and_login(values, password):
-                        pass
-                    payload = (True, "Conexão SMTP validada com sucesso.")
+                    target = EmailService.send_test(values, password)
+                    results.put((True, f"Funcionou! E-mail de teste enviado para {target}."))
                 except Exception as exc:
-                    payload = (False, self._friendly_email_error(exc))
-                self.result_queue.put(("smtp_test", payload))
+                    LOGGER.warning("Teste SMTP falhou: %s", exc)
+                    results.put((False, self._friendly_email_error(exc)))
+
+            def check() -> None:
+                if not window.winfo_exists():
+                    return
+                try:
+                    ok, message = results.get_nowait()
+                except queue.Empty:
+                    elapsed = int(time.monotonic() - started)
+                    test_button.configure(text=f"Testando… {elapsed}s")
+                    window.after(250, check)
+                    return
+                test_button.configure(state="normal", text="Testar SMTP")
+                test_status.configure(
+                    text=message, text_color="#8BE6B1" if ok else "#FFB4A9"
+                )
+                if ok:
+                    messagebox.showinfo("Teste SMTP", message, parent=window)
+                else:
+                    messagebox.showerror("Teste SMTP", message, parent=window)
 
             threading.Thread(target=worker, daemon=True).start()
+            window.after(250, check)
 
         def cancel_settings() -> None:
             if not settings_saved["value"]:
@@ -1396,13 +1661,14 @@ class CameraMuseuApp(ctk.CTk):
 
         window.protocol("WM_DELETE_WINDOW", cancel_settings)
 
-        ctk.CTkButton(
+        test_button = ctk.CTkButton(
             footer,
             text="Testar SMTP",
             fg_color=self.PANEL,
             hover_color="#344952",
             command=test_smtp,
-        ).grid(row=0, column=1, padx=5)
+        )
+        test_button.grid(row=0, column=1, padx=5)
         ctk.CTkButton(
             footer,
             text="Cancelar",
@@ -1526,6 +1792,7 @@ class CameraMuseuApp(ctk.CTk):
     def on_close(self) -> None:
         self.closing = True
         try:
+            self.outbox.stop()
             self.store.save(self.settings)
             self.camera.stop()
             if pygame is not None and pygame.mixer.get_init():
